@@ -13,6 +13,7 @@ import labRouter     from './routes/experienceLab.js';
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
+app.set('trust proxy', 1);
 
 process.on('unhandledRejection', (reason) => { console.error('[unhandledRejection]', reason); });
 process.on('uncaughtException',  (err)    => { console.error('[uncaughtException]',  err);    });
