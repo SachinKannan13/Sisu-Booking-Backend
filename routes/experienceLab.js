@@ -13,7 +13,7 @@ router.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // POST /api/lab/design   { principle, source_ids, session_id }
 router.post('/design', requireAuth, aiLimiter, async (req, res) => {
-  const { principle, source_ids, session_id } = req.body;
+  const { principle, source_ids, session_id, lens } = req.body;
   if (!principle || !principle.trim()) return res.status(400).json({ error: 'principle is required' });
 
   try {
@@ -25,8 +25,14 @@ router.post('/design', requireAuth, aiLimiter, async (req, res) => {
     );
     const formattedChunks = formatChunksWithAttribution(chunks);
 
+    let learningContext = '';
+    try {
+      const ms = await import('../services/memoryService.js');
+      learningContext = await ms.getUserLearningContext(req.user.id);
+    } catch (_) {}
+
     const result = await learnWithSources(
-      { mode: 'experiment', topic: principle, loop_step: 0 },
+      { mode: 'experiment', topic: principle, loop_step: 0, lens: lens || 'life', learning_context: learningContext },
       formattedChunks,
       [],
       principle
@@ -154,18 +160,27 @@ router.post('/:id/capture', requireAuth, async (req, res) => {
   // Best-effort: turn the captured lesson into a permanent insight.
   // Never let a failure here affect the capture response — the
   // experiment is already saved at this point.
-  try {
-    if (lessons_learned && lessons_learned.trim()) {
-      await supabase.from('insights').insert({
-        user_id: req.user.id,
-        session_id: data.session_id || null,
-        source_ids: data.source_ids || [],
-        content: lessons_learned.trim(),
-        tags: ['experiment'],
-        insight_type: 'experiment_result'
-      });
-    }
-  } catch (_) { /* silently no-op — insights table may not exist yet */ }
+  setImmediate(async () => {
+    try {
+      if (!lessons_learned?.trim()) return;
+      const { data: insight, error } = await supabase
+        .from('insights')
+        .insert({
+          user_id:      req.user.id,
+          session_id:   data.session_id || null,
+          source_ids:   data.source_ids || [],
+          content:      lessons_learned.trim(),
+          tags:         ['experiment', data.title?.slice(0, 40) || ''].filter(Boolean),
+          insight_type: 'experiment_result'
+        })
+        .select()
+        .single();
+      if (!error && insight) {
+        const ms = await import('../services/memoryService.js');
+        await ms.processInsightForConcepts(req.user.id, insight).catch(() => {});
+      }
+    } catch (_) { /* silently no-op — insights table may not exist yet */ }
+  });
 
   res.json(data);
 });

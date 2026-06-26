@@ -1,6 +1,6 @@
 import fetch from 'node-fetch';
 import { ANALYSIS_SYSTEM_PROMPT } from '../prompts/analysisPrompt.js';
-import { buildChatSystemPrompt } from '../prompts/chatPrompt.js';
+import { buildChatSystemPrompt, needsVisualization } from '../prompts/chatPrompt.js';
 import { buildModePrompt, MODE_MAX_TOKENS } from '../prompts/learningModePrompts.js';
 
 // OpenRouter — OpenAI-compatible endpoint
@@ -58,16 +58,43 @@ async function callOpenRouterOnce(systemPrompt, messages, maxTokens) {
 
   const data = await response.json();
 
-  // Check if response was truncated due to token limit
+  // FIX 4: If response was truncated, do one continuation call to complete it
   const finishReason = data.choices?.[0]?.finish_reason;
-  if (finishReason === 'length') {
-    console.warn(`[claudeService] Response truncated (finish_reason=length). Consider increasing max_tokens.`);
-  }
-
-  const content = data.choices?.[0]?.message?.content;
+  let content = data.choices?.[0]?.message?.content;
   if (!content) {
     throw new Error('OpenRouter returned empty content');
   }
+
+  if (finishReason === 'length') {
+    console.warn(`[claudeService] Response truncated (finish_reason=length) — attempting continuation.`);
+    try {
+      const continuationBody = {
+        model: body.model,
+        max_tokens: Math.min(maxTokens, 2000),
+        messages: [
+          ...body.messages,
+          { role: 'assistant', content },
+          { role: 'user', content: 'Continue the JSON exactly where it stopped. Do not restart — just continue from the truncation point.' }
+        ]
+      };
+      const contResponse = await fetch(OPENROUTER_URL, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify(continuationBody)
+      });
+      if (contResponse.ok) {
+        const contData = await contResponse.json();
+        const contContent = contData.choices?.[0]?.message?.content;
+        if (contContent) {
+          content = content + contContent;
+          console.log(`[claudeService] Continuation successful, total length now: ${content.length}`);
+        }
+      }
+    } catch (contErr) {
+      console.warn(`[claudeService] Continuation call failed: ${contErr.message} — using truncated response.`);
+    }
+  }
+
   return content;
 }
 
@@ -77,7 +104,7 @@ async function callOpenRouterOnce(systemPrompt, messages, maxTokens) {
  * failure of the request itself. Retry once after a short delay before
  * giving up, instead of immediately failing the whole chat/story request.
  */
-async function callOpenRouter(systemPrompt, messages, maxTokens = 2000) {
+export async function callOpenRouter(systemPrompt, messages, maxTokens = 2000) {
   try {
     return await callOpenRouterOnce(systemPrompt, messages, maxTokens);
   } catch (err) {
@@ -208,7 +235,7 @@ function tryRepairJSON(cleanedInput) {
  * quotes/control-chars inside string values, (3) repair truncation by
  * closing open brackets, (4) both repairs combined.
  */
-function parseJSON(raw, context = 'response') {
+export function parseJSON(raw, context = 'response') {
   const cleaned = stripFences(raw);
 
   try {
@@ -301,8 +328,9 @@ export async function analyzeBook(text, wordCount) {
  * mode: 'reading' (default) — pure literary discussion, no business framing.
  *       'business' — explicitly map the answer to the user's startup.
  */
-export async function chatWithBook(bookAnalysis, relevantChunks, messageHistory, userMessage, mode = 'reading', userProfile = null) {
-  const systemPrompt = buildChatSystemPrompt(bookAnalysis, relevantChunks, mode, userProfile);
+export async function chatWithBook(bookAnalysis, relevantChunks, messageHistory, userMessage, mode = 'reading', userProfile = null, lens = 'personal') {
+  const wantsViz = needsVisualization(userMessage);
+  const systemPrompt = buildChatSystemPrompt(bookAnalysis, relevantChunks, mode, userProfile, lens, wantsViz);
 
   const historyMessages = (messageHistory || []).slice(-10).map(m => ({
     role: m.role,
@@ -314,7 +342,10 @@ export async function chatWithBook(bookAnalysis, relevantChunks, messageHistory,
     { role: 'user', content: userMessage }
   ];
 
-  const raw = await callOpenRouter(systemPrompt, messages, 2500);
+  // Token budget: 5500 when a visualization is requested (SVG ~3000 tokens),
+  // 2500 for all other questions (text + followups is plenty).
+  const maxTokens = wantsViz ? 5500 : 2500;
+  const raw = await callOpenRouter(systemPrompt, messages, maxTokens);
 
   // The model sometimes ignores the "return only JSON" instruction and just
   // answers in plain prose (the content itself is usually still perfectly
@@ -325,14 +356,39 @@ export async function chatWithBook(bookAnalysis, relevantChunks, messageHistory,
   try {
     parsed = parseJSON(raw, 'chat response');
   } catch (_) {
-    console.warn('[claudeService] Chat response was not JSON — using raw text as the answer instead of failing.');
-    parsed = { text: raw.trim(), visualization: null, business_insight: null, suggested_followups: [] };
+    // The AI sometimes outputs prose first, then the JSON block at the end.
+    // Extract just the prose before any ```json ... ``` fence so the fallback
+    // doesn't dump the raw JSON into the message bubble.
+    console.warn('[claudeService] Chat response was not JSON -- extracting prose fallback.');
+    // Strip any ```json fences the model may have added
+    const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    // If the stripped content looks like JSON, try parsing it once more
+    if (stripped.startsWith('{')) {
+      try { parsed = JSON.parse(stripped); } catch (_) { /* still not JSON */ }
+    }
+    if (!parsed) {
+      // Pull plain prose (before any ``` fence)
+      const beforeFence = raw.split(/```(?:json)?/)[0].trim();
+      const text = beforeFence || raw.trim();
+      // Generate minimal context-aware followups from the book title
+      const bookTitle = bookAnalysis?.title || 'this book';
+      parsed = {
+        text,
+        visualization: null,
+        apply_insight: null,
+        suggested_followups: [
+          `What are the main themes in ${bookTitle}?`,
+          `Which part of the book is most practical?`,
+          `What's the single biggest idea in ${bookTitle}?`
+        ]
+      };
+    }
   }
 
   return {
     text: parsed.text || '',
     visualization: parsed.visualization || { type: 'none', title: null, code: null },
-    business_insight: parsed.business_insight || null,
+    business_insight: parsed.apply_insight || parsed.business_insight || null,
     suggested_followups: parsed.suggested_followups || []
   };
 }
@@ -344,14 +400,16 @@ export async function chatWithBook(bookAnalysis, relevantChunks, messageHistory,
  * chatWithBook() above.
  */
 export async function learnWithSources(session, formattedChunks, messageHistory, userMessage) {
-  const { mode, topic, loop_step: loopStep = 0 } = session;
+  const { mode, topic, loop_step: loopStep = 0, lens, user_profile } = session;
 
   const systemPrompt = buildModePrompt(
     mode,
     topic,
     formattedChunks,
     loopStep,
-    session.learning_context || ''
+    session.learning_context || '',
+    lens,
+    user_profile || null
   );
 
   const historyMessages = (messageHistory || [])
@@ -371,8 +429,18 @@ export async function learnWithSources(session, formattedChunks, messageHistory,
   try {
     parsed = parseJSON(raw, `${mode} mode response`);
   } catch (_) {
-    // Graceful fallback: wrap raw text in minimal valid structure
-    parsed = { evidence_blocks: [], response: raw.trim(), followup_questions: [] };
+    // Graceful fallback: map raw text to the mode's primary display field
+    const primaryFieldByMode = {
+      scholar:      'what_authors_said',
+      critic:       'verdict',
+      synthesizer:  'synthesis_insight',
+      practitioner: 'core_principle',
+      teacher:      'response',
+      experiment:   'principle',
+      builder:      'core_insight'
+    };
+    const primaryField = primaryFieldByMode[mode] || 'response';
+    parsed = { evidence_blocks: [], [primaryField]: raw.trim(), followup_questions: [] };
   }
 
   return {
@@ -507,8 +575,8 @@ export async function callOpenRouterStream(systemPrompt, messages, maxTokens, re
       }
     });
     response.body.on('end', () => {
-      res.write('data: [DONE]\n\n');
-      res.end();
+      // Don't res.end() here — let the caller send the final { session } event first,
+      // then call res.end(). Otherwise the client never receives the session payload.
       resolve(fullText);
     });
     response.body.on('error', (err) => {
@@ -519,9 +587,10 @@ export async function callOpenRouterStream(systemPrompt, messages, maxTokens, re
   });
 }
 
+
 export async function reviewExperiment(experiment, actualOutcome) {
   const systemPrompt = `You are a rigorous scientific reviewer helping someone learn from a real-world experiment they ran on a principle from their personal Knowledge Canon.
-Your job: compare what they predicted would happen against what actually happened. Be specific and intellectually honest — don't just validate. Identify surprises, blind spots, and what this reveals about the underlying principle.
+Your job: compare what they predicted would happen against what actually happened. Be specific and intellectually honest -- don't just validate. Identify surprises, blind spots, and what this reveals about the underlying principle.
 Return ONLY this JSON (no markdown, no explanation):
 {"gap_analysis":"2-4 sentences explaining why predicted vs actual differ. What variable wasn't accounted for? What assumption was wrong?","lesson":"One concrete, actionable takeaway that refines the principle or changes how it should be applied.","confidence":"high|medium|low"}`;
   const userMessage = 'Experiment: ' + (experiment.title || experiment.principle) +

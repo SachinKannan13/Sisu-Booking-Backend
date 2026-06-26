@@ -423,7 +423,7 @@ router.get('/:id/chapter-search', requireAuth, async (req, res) => {
 router.get('/:id/progress', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('reading_progress')
-    .select('current_chunk, highlights, notes')
+    .select('current_chunk, highlights, notes, bookmarks')
     .eq('user_id', req.user.id)
     .eq('book_id', req.params.id)
     .single();
@@ -432,12 +432,12 @@ router.get('/:id/progress', requireAuth, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  res.json(data || { current_chunk: 0, highlights: [], notes: [] });
+  res.json(data || { current_chunk: 0, highlights: [], notes: [], bookmarks: [] });
 });
 
 // PUT /api/books/:id/progress
 router.put('/:id/progress', requireAuth, async (req, res) => {
-  const { current_chunk, highlights, notes } = req.body;
+  const { current_chunk, highlights, notes, bookmarks } = req.body;
 
   const { error } = await supabase
     .from('reading_progress')
@@ -447,6 +447,7 @@ router.put('/:id/progress', requireAuth, async (req, res) => {
       current_chunk: current_chunk ?? 0,
       highlights: highlights || [],
       notes: notes || [],
+      bookmarks: bookmarks || [],
       updated_at: new Date().toISOString()
     }, { onConflict: 'book_id,user_id' });
 

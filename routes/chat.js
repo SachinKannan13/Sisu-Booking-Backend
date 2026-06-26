@@ -51,8 +51,10 @@ router.post('/:bookId', requireAuth, async (req, res) => {
 
 async function handleChatMessage(req, res) {
   const { bookId } = req.params;
-  const { message, conversation_id, mode } = req.body;
-  const chatMode = mode === 'business' ? 'business' : 'reading';
+  const { message, conversation_id, mode, lens } = req.body;
+  // Support both old 'business' mode name and new 'apply' mode name
+  const chatMode = (mode === 'business' || mode === 'apply') ? 'apply' : 'reading';
+  const chatLens = lens || 'personal';
   const userId = req.user.id;
 
   if (!message || !message.trim()) {
@@ -192,7 +194,7 @@ async function handleChatMessage(req, res) {
   const historyWithoutLast = (history || []).slice(0, -1);
 
   // Call Claude
-  const aiResponse = await chatWithBook(book, relevantChunks, historyWithoutLast, message, chatMode, userProfile);
+  const aiResponse = await chatWithBook(book, relevantChunks, historyWithoutLast, message, chatMode, userProfile, chatLens);
 
   // Save assistant response
   const { data: assistantMsg, error: assistantError } = await supabase

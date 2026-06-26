@@ -92,6 +92,7 @@ function formatChunks(chunks) {
 // ============================================================
 
 const MAX_CHUNKS_PER_SOURCE = 4;
+const MAX_CHUNKS_SINGLE_SOURCE = 10; // FIX 7: raise cap when only one source selected
 const RRF_K = 60;
 
 /**
@@ -140,7 +141,9 @@ async function retrieveWithRRF(userId, query, limit, filterSourceIds) {
     return { ...rowById.get(id), rrf_score: score };
   });
   scored.sort((a, b) => b.rrf_score - a.rrf_score);
-  return capPerSource(scored, limit);
+  // FIX 7: use higher per-source cap when only one source is selected
+  const singleSource = filterSourceIds && filterSourceIds.length === 1;
+  return capPerSource(scored, limit, singleSource);
 }
 
 async function runSemanticSearch(userId, query, limit, filterSourceIds) {
@@ -171,16 +174,17 @@ async function runFTSSearch(userId, query, limit, filterSourceIds) {
 }
 
 async function retrieveSequential(userId, query, limit, filterSourceIds) {
+  const singleSource = filterSourceIds && filterSourceIds.length === 1;
   try {
     const rows = await runSemanticSearch(userId, query, limit * 3, filterSourceIds);
-    if (rows.length > 0) return capPerSource(rows, limit);
+    if (rows.length > 0) return capPerSource(rows, limit, singleSource);
     throw new Error('no semantic results');
   } catch (err) {
     console.warn(`[ragEngine] Sequential semantic failed: ${err.message}`);
   }
   try {
     const rows = await runFTSSearch(userId, query, limit * 3, filterSourceIds);
-    if (rows.length > 0) return capPerSource(rows, limit);
+    if (rows.length > 0) return capPerSource(rows, limit, singleSource);
   } catch (err) {
     console.error('[ragEngine] Sequential FTS failed:', err.message);
   }
@@ -193,7 +197,7 @@ async function retrieveSequential(userId, query, limit, filterSourceIds) {
       .limit(limit * 3);
     if (filterSourceIds && filterSourceIds.length) q = q.in('book_id', filterSourceIds);
     const { data } = await q;
-    return capPerSource(data || [], limit);
+    return capPerSource(data || [], limit, singleSource);
   } catch (err) {
     console.error('[ragEngine] Sequential fallback failed:', err.message);
     return [];
@@ -203,14 +207,17 @@ async function retrieveSequential(userId, query, limit, filterSourceIds) {
 /**
  * Cap the number of chunks taken from any single source so a giant
  * book can't crowd out smaller sources, then trim to the overall limit.
+ * When singleSource=true, the cap is raised to MAX_CHUNKS_SINGLE_SOURCE
+ * so a deep single-book question gets enough material.
  */
-function capPerSource(rows, limit) {
+function capPerSource(rows, limit, singleSource = false) {
+  const cap = singleSource ? MAX_CHUNKS_SINGLE_SOURCE : MAX_CHUNKS_PER_SOURCE;
   const perSourceCount = {};
   const capped = [];
   for (const row of rows) {
     const key = row.book_id;
     perSourceCount[key] = (perSourceCount[key] || 0) + 1;
-    if (perSourceCount[key] <= MAX_CHUNKS_PER_SOURCE) capped.push(row);
+    if (perSourceCount[key] <= cap) capped.push(row);
     if (capped.length >= limit) break;
   }
   return capped;

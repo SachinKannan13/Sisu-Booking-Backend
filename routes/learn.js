@@ -13,9 +13,9 @@ const SESSIONS_NOT_SET_UP = 'Learning sessions are not set up yet — run migrat
 
 router.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// POST /api/learn/session   { topic, mode, source_ids }
+// POST /api/learn/session   { topic, mode, source_ids, lens? }
 router.post('/session', requireAuth, async (req, res) => {
-  const { topic, mode, source_ids } = req.body;
+  const { topic, mode, source_ids, lens } = req.body;
 
   if (!topic || !topic.trim()) return res.status(400).json({ error: 'topic is required' });
   if (!VALID_MODES.includes(mode)) {
@@ -29,6 +29,7 @@ router.post('/session', requireAuth, async (req, res) => {
       topic: topic.trim(),
       mode,
       source_ids: source_ids || [],
+      lens: lens || 'life',
       loop_step: 0,
       loop_state: {},
       messages: []
@@ -92,24 +93,86 @@ router.post('/session/:id/ask', requireAuth, aiLimiter, async (req, res) => {
   if (sessionError || !session) return res.status(404).json({ error: 'Session not found' });
 
   try {
-    const query = session.topic + '\n\n' + message;
-    const chunks = await retrieveAcrossKB(
-      req.user.id, query, 10,
-      session.source_ids && session.source_ids.length ? session.source_ids : null
-    );
+    // ── FIX 3: Query rewrite for sharper retrieval ──────────────────
+    let retrievalQuery = session.topic + '\n\n' + message;
+    try {
+      const { callOpenRouter: _callOR } = await import('../services/claudeService.js');
+      const rewrittenRaw = await _callOR(
+        'You are a search query optimizer. Given a learning topic and a user question, rewrite them into a single focused search query (1-2 sentences, no bullet points, no preamble) that will retrieve the most relevant passages from a vector database. Output only the query text.',
+        [{ role: 'user', content: `Topic: ${session.topic}\nQuestion: ${message}\nLast context: ${(session.messages || []).slice(-2).map(m => m.role + ': ' + (typeof m.content === 'string' ? m.content.slice(0, 100) : '')).join(' | ')}` }],
+        150
+      );
+      if (rewrittenRaw && rewrittenRaw.trim().length > 10) retrievalQuery = rewrittenRaw.trim();
+    } catch (_) { /* fall back to concatenation */ }
+
+    const filterSourceIds = session.source_ids && session.source_ids.length ? session.source_ids : null;
+    const chunks = await retrieveAcrossKB(req.user.id, retrievalQuery, 10, filterSourceIds);
     const formattedChunks = formatChunksWithAttribution(chunks);
+
     let learningContext = '';
     try {
       const memoryService = await import('../services/memoryService.js');
       learningContext = await memoryService.getUserLearningContext(req.user.id);
     } catch (_) {}
 
+    // ── FIX 1: Build Canon Context from book analysis fields ─────────
+    let canonContext = '';
+    try {
+      // Collect the book IDs to fetch: from session.source_ids if set,
+      // otherwise from the distinct book_ids in retrieved chunks (up to 5)
+      let bookIds = filterSourceIds
+        ? filterSourceIds.slice(0, 5)
+        : [...new Set((chunks || []).map(c => c.book_id).filter(Boolean))].slice(0, 5);
+
+      if (bookIds.length > 0) {
+        const { data: books } = await supabase
+          .from('books')
+          .select('id, title, author, summary, themes, key_frameworks, chapter_breakdown')
+          .in('id', bookIds)
+          .eq('user_id', req.user.id);
+
+        if (books && books.length > 0) {
+          canonContext = books.map(b => {
+            const lines = [];
+            lines.push(`• "${b.title || 'Untitled'}" by ${b.author || 'Unknown Author'}`);
+            if (b.summary) lines.push(`  Summary: ${b.summary.slice(0, 300)}${b.summary.length > 300 ? '…' : ''}`);
+            if (b.themes) {
+              const themes = Array.isArray(b.themes) ? b.themes.join(', ') : String(b.themes).slice(0, 200);
+              if (themes) lines.push(`  Themes: ${themes}`);
+            }
+            if (b.key_frameworks) {
+              const kf = Array.isArray(b.key_frameworks)
+                ? b.key_frameworks.slice(0, 4).map(f => `${f.name || ''} — ${f.description || ''}`).join('; ')
+                : String(b.key_frameworks).slice(0, 300);
+              if (kf.trim()) lines.push(`  Key frameworks: ${kf}`);
+            }
+            if (b.chapter_breakdown) {
+              const cb = Array.isArray(b.chapter_breakdown)
+                ? b.chapter_breakdown.slice(0, 5).map(c => `${c.chapter || ''}: ${c.key_lesson || c.summary || ''}`).join(' | ')
+                : String(b.chapter_breakdown).slice(0, 300);
+              if (cb.trim()) lines.push(`  Chapter map: ${cb}`);
+            }
+            return lines.join('\n');
+          }).join('\n\n');
+        }
+      }
+    } catch (_) { /* canon context is best-effort */ }
+
     // Try streaming path first
     let systemPrompt, maxTokens;
     try {
       const { buildModePrompt, MODE_MAX_TOKENS } = await import('../prompts/learningModePrompts.js');
-      systemPrompt = buildModePrompt(session.mode, session.topic, formattedChunks, session.loop_step || 0, learningContext);
-      maxTokens = MODE_MAX_TOKENS[session.mode] || 2500;
+      // Fetch user profile for lens-aware personalisation (builder mode)
+      let userProfile = null;
+      if (session.mode === 'builder') {
+        try {
+          const { data: profile } = await supabase.from('user_profiles').select('*').eq('user_id', req.user.id).single();
+          userProfile = profile;
+        } catch (_) {}
+      }
+      // Pass canonContext and message so each mode can inject them into the system prompt
+      systemPrompt = buildModePrompt(session.mode, session.topic, formattedChunks, session.loop_step || 0, learningContext, session.lens || 'life', userProfile, canonContext, message);
+      maxTokens = MODE_MAX_TOKENS[session.mode] || 3000;
     } catch (_) {
       // Prompts module unavailable — use non-streaming learnWithSources fallback
       const result = await learnWithSources(
@@ -151,7 +214,18 @@ router.post('/session/:id/ask', requireAuth, aiLimiter, async (req, res) => {
     try {
       parsed = parseAIJSON(fullText, session.mode + ' mode response');
     } catch (_) {
-      parsed = { evidence_blocks: [], response: fullText.trim(), followup_questions: [] };
+      // FIX 5: Map raw text to the mode's primary display field so the UI always renders something
+      const primaryFieldByMode = {
+        scholar:      'what_authors_said',
+        critic:       'verdict',
+        synthesizer:  'synthesis_insight',
+        practitioner: 'core_principle',
+        teacher:      'response',
+        experiment:   'principle',
+        builder:      'core_insight'
+      };
+      const primaryField = primaryFieldByMode[session.mode] || 'response';
+      parsed = { evidence_blocks: [], [primaryField]: fullText.trim(), followup_questions: [] };
     }
 
     const result = {
@@ -175,11 +249,18 @@ router.post('/session/:id/ask', requireAuth, aiLimiter, async (req, res) => {
       { role: 'assistant', content: result.mode_output, created_at: new Date().toISOString() }
     ];
 
+    // Persist (non-blocking — response goes out first)
     supabase
       .from('learning_sessions')
       .update({ messages: updatedMessages, loop_step: nextLoopStep, updated_at: new Date().toISOString() })
       .eq('id', session.id)
       .then(({ error }) => { if (error) console.error('[learn/ask] Session persist error:', error.message); });
+
+    // Send the updated session so the client can re-render StructuredResponse
+    const updatedSession = { ...session, messages: updatedMessages, loop_step: nextLoopStep };
+    res.write(`data: ${JSON.stringify({ session: updatedSession })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
   } catch (err) {
     console.error('[learn/ask] Failed for session ' + session.id + ':', err.message);
     if (!res.headersSent) {
